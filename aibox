@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# aibox - run Claude Code in a container scoped to the current directory.
+set -euo pipefail
+
+IMAGE=aibox:latest
+CREDS="$HOME/.claude/.credentials.json"
+STATE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/aibox"
+CONFIG_DIR=/home/dev/.claude
+
+die() { printf 'aibox: %s\n' "$1" >&2; exit 1; }
+
+dir=$(pwd -P)
+# get innermost dir. Replace whitespace and weird chars with -
+slug=$(printf %s "${dir##*/}" | tr -c '[:alnum:]_.-' '-')
+hash=$(printf %s "$dir" | sha256sum | cut -c1-6)
+name="aibox-${slug:-root}-$hash"
+state="$STATE_ROOT/$name"
+
+usage() {
+  cat <<EOF
+usage: aibox [--help]
+
+Opens the Claude Code TUI with --dangerously-skip-permissions in a container
+that mounts only the current directory.
+
+this directory:
+  box      $name
+  history  $state
+
+  reset the box       docker rm -f $name
+  drop its history    rm -rf $state
+EOF
+}
+
+# aibox takes no arguments of its own
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option $1" ;;
+  esac
+done
+
+command -v docker >/dev/null || die "docker not found on PATH"
+docker info >/dev/null 2>&1 || die "cannot reach the docker daemon"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+  || die "image $IMAGE missing; run install.sh"
+[ -f "$CREDS" ] \
+  || die "no credentials at $CREDS; run 'claude' on the host and log in first"
+
+# config dir
+mkdir -p "$state"
+
+# update container config to match current claude config.
+if [ ! -f "$state/.claude.json" ]; then
+  json_dir=${dir//\\/\\\\}
+  json_dir=${json_dir//\"/\\\"}
+  printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' \
+    "$json_dir" > "$state/.claude.json"
+fi
+
+status=0
+case $(docker container inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing) in
+  missing)
+    # The project is mounted into the container at the same filepath as on host.
+    # docker run starts the container for the first time.
+    docker run -it --name "$name" \
+      -v "$dir:$dir" \
+      -v "$state:$CONFIG_DIR" \
+      -v "$CREDS:$CONFIG_DIR/.credentials.json" \
+      -w "$dir" \
+      -u dev \
+      -e TERM="${TERM:-xterm-256color}" \
+      -e AIBOX=1 \
+      -e GIT_CONFIG_COUNT=1 \
+      -e GIT_CONFIG_KEY_0=safe.directory \
+      -e GIT_CONFIG_VALUE_0="$dir" \
+      "$IMAGE" claude --dangerously-skip-permissions || status=$?
+    ;;
+  exited|created)
+    # -a forwards the TUI and claude's exit code, -i the keyboard
+    docker start -ai "$name" || status=$?
+    ;;
+  running)
+    die "box $name already has a session; one per directory"
+    ;;
+  *)
+    die "box $name is $(docker container inspect -f '{{.State.Status}}' "$name"); docker rm -f $name to reset it"
+    ;;
+esac
+exit "$status"
